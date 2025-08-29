@@ -1,240 +1,475 @@
+# SPDX-License-Identifier: MIT
+# Plagiarism Checker - Streamlit App
+# Provider-agnostic search (Serper.dev or Bing Search v7)
+# Author: You
+# ----------------------------------
+
 import os
-import time
 import re
-import html
+import json
+import time
 import math
 import logging
-from urllib.parse import quote_plus
+from typing import List, Dict, Tuple
 
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# ---------------------------
-# CONFIG / DEFAULTS (Aggressive)
-# ---------------------------
-DEFAULT_CHUNK_SIZE = 30          # words
-DEFAULT_OVERLAP = 12             # words
-DEFAULT_RESULTS_PER_CHUNK = 10   # try 20 if you want even more recall
-DEFAULT_THRESHOLD = 0.42         # 42% similarity
-DEFAULT_DELAY = 1.1              # seconds between web queries
+# --------------------------
+# Defaults / constants
+# --------------------------
+BING_ENDPOINT_DEFAULT = "https://api.bing.microsoft.com/v7.0/search"
+SERPER_ENDPOINT_DEFAULT = "https://google.serper.dev/search"
 
-BING_ENDPOINT = "https://api.bing.microsoft.com/v7.0/search"
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0 Safari/537.36"
+)
 
-# ---------------------------
-# SIMPLE TOKEN HELPERS
-# ---------------------------
-_word_re = re.compile(r"[A-Za-z0-9']+")
+logging.basicConfig(level=logging.INFO)
 
-def normalize_text(txt: str) -> str:
-    # unescape & compress whitespace
-    t = html.unescape(txt or "")
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
 
-def tokenize(text: str) -> list:
-    return [w.lower() for w in _word_re.findall(text)]
+# --------------------------
+# Text utilities
+# --------------------------
+def clean_text(s: str) -> str:
+    """Minimal normalization for comparison."""
+    if not s:
+        return ""
+    s = s.replace("\u00a0", " ").replace("\u200b", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def jaccard_similarity(a_tokens: list, b_tokens: list) -> float:
-    if not a_tokens or not b_tokens:
+
+def tokenize_words(s: str) -> List[str]:
+    """Very simple tokenization: letters/numbers only, lowercased."""
+    s = s.lower()
+    tokens = re.findall(r"[a-z0-9]+", s)
+    return tokens
+
+
+def make_ngrams(tokens: List[str], n: int = 5) -> List[Tuple[str, ...]]:
+    if n <= 1:
+        return [(t,) for t in tokens]
+    return [tuple(tokens[i : i + n]) for i in range(0, max(0, len(tokens) - n + 1))]
+
+
+def jaccard_similarity(ngrams_a, ngrams_b) -> float:
+    """Jaccard similarity on n-gram sets [0..1]."""
+    set_a, set_b = set(ngrams_a), set(ngrams_b)
+    if not set_a or not set_b:
         return 0.0
-    set_a = set(a_tokens)
-    set_b = set(b_tokens)
     inter = len(set_a & set_b)
     union = len(set_a | set_b)
-    if union == 0:
-        return 0.0
-    return inter / union
+    return inter / union if union else 0.0
 
-# ---------------------------
-# CHUNKING
-# ---------------------------
-def make_chunks(text: str, chunk_size: int, overlap: int) -> list:
-    tokens = tokenize(text)
+
+def split_into_chunks(text: str, chunk_size: int, overlap: int) -> List[str]:
+    """
+    Split text (by words) into chunks of size 'chunk_size' with 'overlap' words overlap.
+    """
+    tokens = text.split()
     if not tokens:
         return []
 
-    step = max(1, chunk_size - overlap)
+    if chunk_size <= 0:
+        return [" ".join(tokens)]
+
     chunks = []
-    for start in range(0, max(1, len(tokens) - chunk_size + 1), step):
-        piece = tokens[start:start + chunk_size]
-        if piece:
-            chunks.append(" ".join(piece))
-    # edge case: if text shorter than chunk size, just one chunk
-    if not chunks and tokens:
-        chunks.append(" ".join(tokens))
+    i = 0
+    stride = max(1, chunk_size - max(0, overlap))
+    while i < len(tokens):
+        chunk_tokens = tokens[i : i + chunk_size]
+        if not chunk_tokens:
+            break
+        chunks.append(" ".join(chunk_tokens))
+        i += stride
+        if i >= len(tokens):
+            break
+
     return chunks
 
-# ---------------------------
-# BING WEB SEARCH
-# ---------------------------
-def bing_search(api_key: str, query: str, count: int = 10) -> list:
+
+def query_from_chunk(chunk: str, query_words: int = 12) -> str:
+    """
+    Construct a search query from the first 'query_words' words of a chunk.
+    Keep it relatively short so providers return matches instead of 'too long queries'.
+    """
+    words = chunk.split()
+    return " ".join(words[: max(1, query_words)])
+
+
+# --------------------------
+# Fetch remote page text
+# --------------------------
+def fetch_page_text(url: str, timeout: int = 12, max_chars: int = 80_000) -> str:
+    """
+    Fetch HTML and return visible text for deeper comparison.
+    """
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
+        r.raise_for_status()
+        html = r.text[: max_chars * 3]  # cut before parsing
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Remove script/style
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        text = soup.get_text(separator=" ")
+        text = clean_text(text)[:max_chars]
+        return text
+    except Exception as e:
+        logging.warning("fetch_page_text error for %s: %s", url, e)
+        return ""
+
+
+# --------------------------
+# Provider: Serper (Google)
+# --------------------------
+def serper_search(api_key: str, query: str, endpoint: str, count: int = 10) -> List[Dict]:
+    """
+    Query Serper (Google) and return normalized results
+    with keys: name, snippet, url
+    """
+    endpoint = (endpoint or SERPER_ENDPOINT_DEFAULT).strip()
+    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+    payload = {"q": query, "num": max(1, min(count, 20)), "hl": "en", "gl": "us"}
+
+    try:
+        r = requests.post(endpoint, headers=headers, data=json.dumps(payload), timeout=12)
+        if r.status_code in (401, 403):
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text
+            return [{"auth_error": True, "detail": str(detail)}]
+        if r.status_code == 429:
+            return [{"rate_limited": True}]
+        r.raise_for_status()
+
+        data = r.json() or {}
+        organic = data.get("organic", []) or []
+        results = []
+        for item in organic:
+            results.append(
+                {
+                    "name": item.get("title") or "",
+                    "snippet": item.get("snippet") or "",
+                    "url": item.get("link") or "",
+                }
+            )
+        return results
+    except Exception as e:
+        logging.exception("Serper error: %s", e)
+        return []
+
+
+# --------------------------
+# Provider: Bing
+# --------------------------
+def bing_search(api_key: str, query: str, endpoint: str, count: int = 10) -> List[Dict]:
+    """
+    Query Bing Web Search v7.
+    Return normalized results: name, snippet, url
+    """
+    endpoint = (endpoint or BING_ENDPOINT_DEFAULT).strip()
+    if not endpoint.rstrip("/").endswith("search"):
+        endpoint = endpoint.rstrip("/") + "/v7.0/search"
+
     headers = {"Ocp-Apim-Subscription-Key": api_key}
     params = {
         "q": query,
-        "count": max(1, min(count, 50)),  # bing caps count
+        "count": max(1, min(count, 50)),
         "mkt": "en-US",
         "safeSearch": "Off",
         "textDecorations": False,
         "textFormat": "Raw",
     }
+
     try:
-        r = requests.get(BING_ENDPOINT, headers=headers, params=params, timeout=12)
+        r = requests.get(endpoint, headers=headers, params=params, timeout=12)
+        if r.status_code in (401, 403):
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text
+            return [{"auth_error": True, "detail": str(detail)}]
         if r.status_code == 429:
-            # rate-limited
             return [{"rate_limited": True}]
         r.raise_for_status()
-        data = r.json()
-        web_pages = data.get("webPages", {}).get("value", [])
-        return [
-            {
-                "name": item.get("name") or "",
-                "snippet": item.get("snippet") or "",
-                "url": item.get("url") or "",
-            }
-            for item in web_pages
-        ]
+
+        data = r.json() or {}
+        web_pages = data.get("webPages", {}).get("value", []) or []
+        results = []
+        for item in web_pages:
+            results.append(
+                {
+                    "name": item.get("name") or "",
+                    "snippet": item.get("snippet") or "",
+                    "url": item.get("url") or "",
+                }
+            )
+        return results
     except Exception as e:
-        logging.exception("Bing search error: %s", e)
+        logging.exception("Bing error: %s", e)
         return []
 
-# ---------------------------
-# FETCH PAGE TEXT
-# ---------------------------
-def fetch_page_text(url: str, max_chars: int = 120_000) -> str:
-    if not url.startswith("http"):
-        return ""
-    try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        html_text = r.text[:max_chars]
-        soup = BeautifulSoup(html_text, "html.parser")
-        # remove scripts/styles/navs
-        for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
-            tag.decompose()
-        # join paragraphs
-        text = " ".join(x.get_text(separator=" ", strip=True) for x in soup.find_all(["p", "article", "div"]))
-        return normalize_text(text)[:max_chars]
-    except Exception:
-        return ""
 
-# ---------------------------
-# SCAN LOGIC
-# ---------------------------
-def scan_text(api_key: str,
-              full_text: str,
-              chunk_size: int,
-              overlap: int,
-              results_per_chunk: int,
-              threshold: float,
-              delay: float):
-    matches = []
-    chunks = make_chunks(full_text, chunk_size, overlap)
-
-    st.write(f"**Chunks:** {len(chunks)}  •  **Chunk size:** {chunk_size} words  •  **Overlap:** {overlap}")
+# --------------------------
+# Main scan logic
+# --------------------------
+def scan_text(
+    text: str,
+    provider: str,
+    api_key: str,
+    endpoint: str,
+    *,
+    chunk_size: int,
+    overlap: int,
+    results_per_chunk: int,
+    threshold_pct: int,
+    delay_sec: float,
+    retries: int,
+    ngram_n: int,
+    fetch_full_pages: bool,
+    confirm_threshold_pct: int,
+) -> List[Dict]:
+    """
+    Process text in chunks, query search, compute similarities,
+    return list of suspicious matches (dicts).
+    """
+    suspicious = []
+    chunks = split_into_chunks(clean_text(text), chunk_size, overlap)
     if not chunks:
-        return matches
+        return suspicious
 
-    total = len(chunks)
-    progress = st.progress(0, text="Scanning…")
+    threshold = threshold_pct / 100.0
+    confirm_threshold = confirm_threshold_pct / 100.0
 
-    for i, chunk in enumerate(chunks, start=1):
-        # Query: we use the chunk itself (short enough)
-        q = chunk
-        results = bing_search(api_key, q, count=results_per_chunk)
+    # choose the function
+    def do_search(q, k):
+        if provider.startswith("Serper"):
+            return serper_search(api_key, q, endpoint, count=k)
+        else:
+            return bing_search(api_key, q, endpoint, count=k)
 
-        # Rate limit handling
-        if results and isinstance(results[0], dict) and results[0].get("rate_limited"):
-            time.sleep(max(2.0, delay * 2))
-            results = bing_search(api_key, q, count=results_per_chunk)
+    st.write(f"Scanning **{len(chunks)}** chunk(s)…")
+    prog = st.progress(0)
+    for idx, chunk in enumerate(chunks, start=1):
+        # 1) form query
+        query = query_from_chunk(chunk, query_words=12)
+        # 2) call search with backoff
+        attempt = 0
+        while True:
+            results = do_search(query, results_per_chunk)
+            if results and isinstance(results[0], dict) and results[0].get("auth_error"):
+                detail = results[0].get("detail", "")
+                st.error(
+                    f"Authentication error from {provider}. "
+                    f"Check your API key / subscription. Details: {detail}"
+                )
+                return suspicious
+            if results and isinstance(results[0], dict) and results[0].get("rate_limited"):
+                # rate limit – back off
+                time.sleep(max(1.2, delay_sec))
+                attempt += 1
+                if attempt > retries:
+                    break
+                continue
+            break
 
-        chunk_tokens = chunk.split()
-        for item in results:
-            url = item.get("url", "")
-            # first compare with the snippet to short-circuit
-            snippet_text = normalize_text(f"{item.get('name','')} {item.get('snippet','')}")
-            sim1 = jaccard_similarity(chunk_tokens, tokenize(snippet_text))
-            best_sim = sim1
-            best_text = "snippet"
+        # 3) compare snippet similarity → optional full page confirmation
+        chunk_tokens = tokenize_words(chunk)
+        chunk_ngrams = make_ngrams(chunk_tokens, n=ngram_n)
 
-            # If snippet weak, try full page
-            if best_sim < threshold and url:
+        best_for_chunk = None
+        for r in results or []:
+            name = clean_text(r.get("name", ""))
+            snippet = clean_text(r.get("snippet", ""))
+            url = r.get("url", "")
+
+            snippet_tokens = tokenize_words(snippet)
+            snippet_ngrams = make_ngrams(snippet_tokens, n=ngram_n)
+            sim_snippet = jaccard_similarity(chunk_ngrams, snippet_ngrams)
+
+            # keep if snippet already clears the threshold
+            if sim_snippet >= threshold:
+                info = {
+                    "chunk_index": idx,
+                    "chunk_preview": chunk[:140] + ("…" if len(chunk) > 140 else ""),
+                    "url": url,
+                    "title": name,
+                    "from": "snippet",
+                    "similarity": round(sim_snippet * 100, 1),
+                }
+                best_for_chunk = (sim_snippet, info)
+                # still do a confirm check if asked
+            elif fetch_full_pages and sim_snippet >= (threshold * 0.6):
+                # borderline on snippet → fetch page for confirmation
                 page_text = fetch_page_text(url)
                 if page_text:
-                    sim2 = jaccard_similarity(chunk_tokens, tokenize(page_text))
-                    if sim2 > best_sim:
-                        best_sim = sim2
-                        best_text = "page"
+                    page_tokens = tokenize_words(page_text)
+                    page_ngrams = make_ngrams(page_tokens, n=ngram_n)
+                    sim_page = jaccard_similarity(chunk_ngrams, page_ngrams)
+                    if sim_page >= confirm_threshold:
+                        info = {
+                            "chunk_index": idx,
+                            "chunk_preview": chunk[:140] + ("…" if len(chunk) > 140 else ""),
+                            "url": url,
+                            "title": name,
+                            "from": "page",
+                            "similarity": round(sim_page * 100, 1),
+                        }
+                        best_for_chunk = (sim_page, info)
 
-            if best_sim >= threshold:
-                matches.append({
-                    "similarity": best_sim,
-                    "url": url,
-                    "used": best_text,
-                    "excerpt": item.get("snippet", "")[:300],
-                })
+        if best_for_chunk:
+            suspicious.append(best_for_chunk[1])
 
-        progress.progress(i / total, text=f"Scanning chunk {i}/{total}")
-        time.sleep(max(0.1, delay))
+        # progress + pacing
+        prog.progress(min(100, int(idx / len(chunks) * 100)))
+        time.sleep(max(0.0, delay_sec))
 
-    # sort high → low
-    matches.sort(key=lambda x: x["similarity"], reverse=True)
-    return matches
+    prog.progress(100)
+    return suspicious
 
-# ---------------------------
-# STREAMLIT UI
-# ---------------------------
-st.set_page_config(page_title="Web Plagiarism Checker", page_icon="🔎", layout="wide")
 
-st.title("🔎 Web Plagiarism Checker (Aggressive Mode Defaults)")
+# --------------------------
+# Streamlit UI
+# --------------------------
+st.set_page_config(page_title="Plagiarism Checker", page_icon="🧭", layout="wide")
+st.title("🧭 Plagiarism Checker (Web Search)")
 
-api_key = st.text_input(
-    "Bing Web Search API Key",
-    value=os.getenv("BING_API_KEY", ""),
-    type="password",
-    help="Paste your Bing Web Search v7 key."
+st.markdown(
+    """
+Paste text below or upload a `.txt` file. The app splits it into chunks and checks each
+chunk against the web using **Serper (Google)** or **Bing**. It computes a similarity score
+based on n-gram Jaccard overlap.  
+Use **Aggressive** settings for best recall; it will be slower and use more API calls.
+"""
 )
 
-text = st.text_area("Paste the text to check", height=300, placeholder="Paste up to ~12–15k words…")
+# Input area
+col_a, col_b = st.columns([2, 1])
+with col_a:
+    text_input = st.text_area("Text to check", height=260, placeholder="Paste up to ~15,000 words…")
+    up = st.file_uploader("…or upload a .txt file", type=["txt"])
+    if up and not text_input:
+        text_input = up.read().decode(errors="ignore")
 
-with st.expander("Scan settings", expanded=True):
-    cols = st.columns(5)
-    with cols[0]:
-        chunk_size = st.number_input("Chunk size (words)", min_value=10, max_value=200, value=DEFAULT_CHUNK_SIZE, step=2)
-    with cols[1]:
-        overlap = st.number_input("Overlap (words)", min_value=0, max_value=100, value=DEFAULT_OVERLAP, step=1)
-    with cols[2]:
-        results_per_chunk = st.slider("Search results per chunk", 1, 20, DEFAULT_RESULTS_PER_CHUNK)
-    with cols[3]:
-        threshold_perc = st.slider("Flag if similarity ≥ (%)", 20, 90, int(DEFAULT_THRESHOLD * 100))
-        threshold = threshold_perc / 100.0
-    with cols[4]:
-        delay = st.number_input("Delay between searches (sec)", min_value=0.1, max_value=2.5, value=DEFAULT_DELAY, step=0.1)
+with col_b:
+    st.subheader("Search Provider")
+    provider = st.selectbox("Provider", ["Serper (Google) - Recommended", "Bing"], index=0)
 
-run = st.button("Run Check", type="primary", disabled=not (api_key and text.strip()))
+    if provider.startswith("Serper"):
+        api_key = st.text_input(
+            "Serper API Key",
+            type="password",
+            value=os.getenv("SERPER_API_KEY", ""),
+            help="Get one at https://serper.dev",
+        )
+        endpoint = st.text_input(
+            "Serper endpoint",
+            value=os.getenv("SERPER_ENDPOINT", SERPER_ENDPOINT_DEFAULT),
+        )
+    else:
+        api_key = st.text_input(
+            "Bing API Key",
+            type="password",
+            value=os.getenv("BING_API_KEY", ""),
+            help="Bing Web Search v7",
+        )
+        endpoint = st.text_input(
+            "Bing endpoint",
+            value=os.getenv("BING_ENDPOINT", BING_ENDPOINT_DEFAULT),
+        )
 
 st.divider()
 
-if run:
-    with st.spinner("Working…"):
-        results = scan_text(
-            api_key=api_key,
-            full_text=text,
-            chunk_size=int(chunk_size),
-            overlap=int(overlap),
-            results_per_chunk=int(results_per_chunk),
-            threshold=float(threshold),
-            delay=float(delay),
-        )
+# Controls
+with st.sidebar:
+    st.header("Settings")
 
-    if not results:
-        st.success("No suspicious matches **above your threshold** were found.")
-        st.info("Tip: Decrease the threshold, reduce chunk size, or increase results per chunk for a broader scan.")
+    mode = st.radio("Preset", ["Balanced", "Aggressive (catch more, slower)"], index=0)
+
+    if mode.startswith("Aggressive"):
+        chunk_size = st.number_input("Chunk size (words)", 10, 5000, 30, step=2)
+        overlap = st.number_input("Overlap (words)", 0, 500, 14, step=1)
+        results_per_chunk = st.slider("Search results per chunk", 1, 20, 10, 1)
+        threshold_pct = st.slider("Flag if similarity ≥ (%)", 10, 95, 42, 1)
+        delay_sec = st.number_input("Delay between searches (sec)", 0.1, 3.0, 1.1, step=0.05)
     else:
-        st.subheader(f"Matches found ({len(results)})")
-        for m in results[:300]:  # don't render infinite
-            st.markdown(
-                f"- **Similarity:** {m['similarity']:.0%}  •  **Source:** [{m['url']}]({m['url']})  "
-                f"• *(matched on {m['used']})*\n\n"
-                f"  > {m['excerpt']}"
-            )
+        chunk_size = st.number_input("Chunk size (words)", 10, 5000, 120, step=10)
+        overlap = st.number_input("Overlap (words)", 0, 500, 30, step=2)
+        results_per_chunk = st.slider("Search results per chunk", 1, 20, 6, 1)
+        threshold_pct = st.slider("Flag if similarity ≥ (%)", 10, 95, 55, 1)
+        delay_sec = st.number_input("Delay between searches (sec)", 0.1, 3.0, 0.7, step=0.05)
+
+    ngram_n = st.slider("n-gram size", 2, 8, 5, 1)
+    retries = st.slider("Retries on 429/5xx", 0, 5, 2, 1)
+
+    st.markdown("### Confirmation (optional)")
+    fetch_full_pages = st.checkbox(
+        "Fetch web pages for confirmation (slower, more accurate)", value=True
+    )
+    confirm_threshold_pct = st.slider("Confirm if similarity ≥ (%)", 10, 95, 45, 1)
+
+    st.caption(
+        "Tip: smaller chunks + larger overlap + more results per chunk + lower threshold "
+        "→ catches more but costs more and runs slower."
+    )
+
+st.divider()
+
+if st.button("Run check", type="primary", use_container_width=True):
+    if not text_input or len(text_input.strip()) < 20:
+        st.warning("Please paste some text or upload a `.txt` file.")
+        st.stop()
+    if not api_key:
+        st.error("Please provide a valid API key for the selected provider.")
+        st.stop()
+
+    n_words = len(text_input.split())
+    st.write(f"Input length: **{n_words}** words")
+
+    matches = scan_text(
+        text=text_input,
+        provider="Serper" if provider.startswith("Serper") else "Bing",
+        api_key=api_key,
+        endpoint=endpoint,
+        chunk_size=int(chunk_size),
+        overlap=int(overlap),
+        results_per_chunk=int(results_per_chunk),
+        threshold_pct=int(threshold_pct),
+        delay_sec=float(delay_sec),
+        retries=int(retries),
+        ngram_n=int(ngram_n),
+        fetch_full_pages=bool(fetch_full_pages),
+        confirm_threshold_pct=int(confirm_threshold_pct),
+    )
+
+    st.subheader("Results")
+    if not matches:
+        st.success("No suspicious matches above your threshold were found.")
+        st.info(
+            "Try **Aggressive** preset or manually set: chunk≈30, overlap≈12–15, "
+            "results per chunk=10–20, threshold≈40–45%, delay≈1.0–1.2 s."
+        )
+    else:
+        matches = sorted(matches, key=lambda x: -x["similarity"])
+        for m in matches:
+            with st.expander(
+                f'Chunk {m["chunk_index"]} • {m["similarity"]}% • {m["title"][:80]}'
+            ):
+                st.write(f"**URL:** {m['url']}")
+                st.write(f"**Detected from:** {m['from']}")
+                st.write(f"**Chunk preview:** {m['chunk_preview']}")
+        st.success(f"Found **{len(matches)}** suspicious match(es).")
+
+
+st.caption(
+    "This tool estimates similarity using public search results. "
+    "It is not a definitive legal plagiarism determination."
+)
